@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Telegram Session
+*.session
+*.session-journal
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+logs/
+*.log
+
+# Output files (опционально, можно закомментировать если нужно хранить)
+# output/
+# input/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.orig
+
+# Test files
+test_*.py
+*_test.py
+
