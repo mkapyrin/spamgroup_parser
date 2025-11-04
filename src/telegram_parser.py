@@ -6,6 +6,7 @@ import aiohttp
 import json
 import hashlib
 import glob
+import time
 from pathlib import Path
 from telethon import TelegramClient
 from telethon.errors import (
@@ -802,6 +803,18 @@ class TelegramGroupParser:
                     if username_str and username_str.lower() not in ('nan', 'none', ''):
                         processed_usernames.add(username_str.lower())
             
+            # Также проверяем поле username из входного CSV (если оно есть в выходном файле)
+            if 'username' in existing_df.columns:
+                for username_val in existing_df['username'].dropna():
+                    username_str = str(username_val).strip()
+                    # Убираем https://t.me/ или @ в начале
+                    if username_str.startswith('https://t.me/'):
+                        username_str = username_str[13:]  # Убираем 'https://t.me/'
+                    elif username_str.startswith('@'):
+                        username_str = username_str[1:]  # Убираем '@'
+                    if username_str and username_str.lower() not in ('nan', 'none', ''):
+                        processed_usernames.add(username_str.lower())
+            
             self.logger.info(f"📋 Загружено {len(existing_df)} существующих записей")
             self.logger.info(f"   - По ID: {len(processed_ids)} записей")
             self.logger.info(f"   - По username: {len(processed_usernames)} записей")
@@ -824,13 +837,32 @@ class TelegramGroupParser:
             self.logger.warning(f"⚠️  Ошибка при загрузке существующих данных: {e}")
             return pd.DataFrame(), set(), set()
     
-    def _is_already_processed(self, chat_identifier, processed_ids, processed_usernames):
-        """Проверяет, была ли группа уже обработана"""
+    def _is_already_processed(self, chat_identifier, processed_ids, processed_usernames, row=None):
+        """Проверяет, была ли группа уже обработана
+        
+        Args:
+            chat_identifier: ID группы (int) или username (str)
+            processed_ids: Множество уже обработанных ID
+            processed_usernames: Множество уже обработанных username (нормализованных)
+            row: Опционально, строка DataFrame для проверки поля username из входного CSV
+        """
         # Проверяем по ID
         if isinstance(chat_identifier, int):
-            return str(chat_identifier) in processed_ids
+            if str(chat_identifier) in processed_ids:
+                return True
         
-        # Проверяем по username
+        # Также проверяем ID из входной строки (если есть)
+        if row is not None:
+            input_id = row.get('id')
+            if input_id and pd.notna(input_id):
+                try:
+                    input_id_str = str(int(float(input_id)))  # Конвертируем в int через float для корректной обработки
+                    if input_id_str in processed_ids:
+                        return True
+                except (ValueError, TypeError):
+                    pass
+        
+        # Проверяем по username из chat_identifier
         if isinstance(chat_identifier, str):
             # Нормализуем username: убираем @, https://t.me/, приводим к lowercase
             username_str = chat_identifier.strip()
@@ -839,7 +871,22 @@ class TelegramGroupParser:
             elif username_str.startswith('@'):
                 username_str = username_str[1:]  # Убираем '@'
             username_str = username_str.lower()
-            return username_str in processed_usernames
+            if username_str in processed_usernames:
+                return True
+        
+        # Также проверяем username из входной строки (если есть)
+        if row is not None:
+            input_username = row.get('username')
+            if input_username and pd.notna(input_username):
+                username_str = str(input_username).strip()
+                # Убираем https://t.me/ или @ в начале
+                if username_str.startswith('https://t.me/'):
+                    username_str = username_str[13:]
+                elif username_str.startswith('@'):
+                    username_str = username_str[1:]
+                username_str = username_str.lower()
+                if username_str and username_str not in ('nan', 'none', '') and username_str in processed_usernames:
+                    return True
         
         return False
     
@@ -978,28 +1025,63 @@ class TelegramGroupParser:
             # Создаем список для новых данных
             new_rows = []
             
+            # Время начала обработки для расчета прогноза
+            start_time = time.time()
+            total_groups = len(df)
+            
+            # Функция форматирования времени
+            def format_time(seconds):
+                if seconds < 60:
+                    return f"{int(seconds)}с"
+                elif seconds < 3600:
+                    return f"{int(seconds // 60)}м {int(seconds % 60)}с"
+                else:
+                    hours = int(seconds // 3600)
+                    minutes = int((seconds % 3600) // 60)
+                    return f"{hours}ч {minutes}м"
+            
             # Используем tqdm для прогресс-бара
             for index in tqdm(range(len(df)), desc="Обработка групп"):
                 row = df.iloc[index]
+                current_position = index + 1
                 
                 # Определяем идентификатор чата
                 chat_identifier = self._get_chat_identifier(row)
                 
                 if not chat_identifier:
                     # Пропускаем строки без валидного идентификатора - они не могут быть обработаны
-                    self.logger.warning(f"⚠️  Строка {index + 1}: нет валидного идентификатора (title: '{row.get('title', 'N/A')}') - пропускаем")
+                    self.logger.warning(f"⚠️  Строка {current_position}/{total_groups}: нет валидного идентификатора (title: '{row.get('title', 'N/A')}') - пропускаем")
                     errors += 1
                     continue
                 
                 # Проверяем, была ли группа уже обработана
-                if self._is_already_processed(chat_identifier, processed_ids, processed_usernames):
-                    self.logger.info(f"⏭️  Пропускаем {chat_identifier} - уже обработана")
+                if self._is_already_processed(chat_identifier, processed_ids, processed_usernames, row=row):
+                    group_title = row.get('title', 'Без названия')
+                    self.logger.info(f"⏭️  [{current_position}/{total_groups}] Пропускаем '{group_title}' ({chat_identifier}) - уже обработана")
                     skipped += 1
                     continue
                 
-                # Логируем прогресс
-                progress_msg = log_progress(index + 1, len(df), "групп")
-                self.logger.info(f"{progress_msg} - {row.get('title', 'Без названия')} ({chat_identifier})")
+                # Рассчитываем прогресс и время (только для групп, которые будут обрабатываться)
+                remaining_groups = total_groups - current_position
+                elapsed_time = time.time() - start_time
+                processed_count = current_position - skipped - errors - 1  # -1 потому что текущую еще не обработали
+                avg_time_per_group = elapsed_time / processed_count if processed_count > 0 else 0
+                estimated_remaining_time = avg_time_per_group * remaining_groups if avg_time_per_group > 0 else 0
+                
+                # Диагностический вывод
+                group_title = row.get('title', 'Без названия')
+                group_id = row.get('id', 'N/A')
+                group_username = row.get('username', 'N/A')
+                
+                self.logger.info("")
+                self.logger.info(f"📊 Прогресс: {current_position}/{total_groups} групп | Осталось: {remaining_groups}")
+                self.logger.info(f"⏱️  Время: прошло {format_time(elapsed_time)} | Осталось ~{format_time(estimated_remaining_time)}")
+                self.logger.info(f"📋 Текущая группа: '{group_title}'")
+                if group_id and pd.notna(group_id) and str(group_id) != 'nan':
+                    self.logger.info(f"   ID: {group_id}")
+                if group_username and pd.notna(group_username) and str(group_username) != 'nan':
+                    self.logger.info(f"   Username: {group_username}")
+                self.logger.info(f"   Идентификатор: {chat_identifier}")
                 
                 # Получаем информацию о группе
                 info = await self.get_chat_info(chat_identifier)
@@ -1014,10 +1096,21 @@ class TelegramGroupParser:
                     status = info.get('access_status', 'error')
                     if status == 'success':
                         successful += 1
+                        self.logger.info(f"✅ Успешно обработана: {info.get('actual_title', group_title)}")
+                        if 'members_count' in info:
+                            self.logger.info(f"   Участников: {info.get('members_count', 'N/A')}")
+                        if 'can_send_messages' in info:
+                            self.logger.info(f"   Можно постить: {info.get('can_send_messages', 'N/A')}")
                     elif status == 'access_denied':
                         access_denied += 1
+                        self.logger.warning(f"🚫 Доступ запрещен: {group_title}")
                     else:
                         errors += 1
+                        error_msg = info.get('error_message', 'Неизвестная ошибка')
+                        self.logger.error(f"❌ Ошибка: {error_msg}")
+                else:
+                    errors += 1
+                    self.logger.error(f"❌ Не удалось получить информацию о группе")
                 
                 # Промежуточное сохранение каждые 10 записей
                 if len(new_rows) > 0 and len(new_rows) % 10 == 0:

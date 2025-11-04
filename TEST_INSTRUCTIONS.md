@@ -28,7 +28,7 @@ python check_dependencies.py
 
 #### Режим 1: Обработка всех файлов из input/ (рекомендуется)
 ```bash
-python "main 2.py" --all-files
+python main.py --all-files
 ```
 
 Этот режим:
@@ -41,7 +41,7 @@ python "main 2.py" --all-files
 
 #### Режим 2: Обработка одного файла
 ```bash
-python "main 2.py" --input input/groups.csv
+python main.py --input input/groups.csv
 ```
 
 ### 4. Проверка результатов

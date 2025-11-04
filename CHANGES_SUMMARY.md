@@ -32,13 +32,13 @@
 source venv/bin/activate
 
 # Обработайте все файлы из input/
-python "main 2.py" --all-files
+python main.py --all-files
 ```
 
 ### Обработка одного файла (как раньше)
 
 ```bash
-python "main 2.py" --input input/groups.csv
+python main.py --input input/groups.csv
 ```
 
 ## 📊 Структура файлов
@@ -54,7 +54,7 @@ spamgroup_parser/
 ├── logs/
 │   ├── processed_files.log   # Лог обработанных файлов
 │   └── telegram_parser_*.log  # Детальные логи
-└── main 2.py
+└── main.py
 ```
 
 ## 🔍 Как работает отслеживание файлов
