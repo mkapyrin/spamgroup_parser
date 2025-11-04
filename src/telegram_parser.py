@@ -7,6 +7,9 @@ import json
 import hashlib
 import glob
 import time
+import warnings
+import sqlite3
+import subprocess
 from pathlib import Path
 from telethon import TelegramClient
 from telethon.errors import (
@@ -37,6 +40,11 @@ class TelegramGroupParser:
         self.min_delay = 3.0
         self.max_delay = 7.0
         self.current_user_id = None  # ID текущего пользователя для проверки прав
+        
+        # Подавляем предупреждение о существующей сессии глобально при инициализации
+        warnings.filterwarnings("ignore", message=".*session already had an authorized user.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*the session already had an authorized user.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*did not login to the user account.*", category=UserWarning)
         
     async def get_member_count_via_bot_api(self, chat_identifier, bot_token=None):
         '''Получает количество участников через Bot API (если доступен bot token)'''
@@ -107,10 +115,29 @@ class TelegramGroupParser:
             self.client = TelegramClient(session_path, Config.API_ID, Config.API_HASH)
             
             self.logger.info("Подключение к Telegram...")
-            await self.client.start(phone=Config.PHONE)
             
-            # Проверяем авторизацию
-            me = await self.client.get_me()
+            # Подключаемся к серверу
+            await self.client.connect()
+            
+            # Подавляем предупреждение о существующей авторизованной сессии
+            # Telethon выдает это предупреждение при вызове start() с phone, если сессия уже авторизована
+            # Это нормальное поведение - мы просто используем существующую сессию
+            with warnings.catch_warnings():
+                # Подавляем все варианты сообщения о существующей сессии
+                warnings.filterwarnings("ignore", message=".*session already had an authorized user.*", category=UserWarning)
+                warnings.filterwarnings("ignore", message=".*the session already had an authorized user.*", category=UserWarning)
+                warnings.filterwarnings("ignore", message=".*did not login to the user account.*", category=UserWarning)
+                
+                # Проверяем, авторизован ли уже клиент
+                if await self.client.is_user_authorized():
+                    self.logger.info("✅ Используется существующая авторизованная сессия")
+                    me = await self.client.get_me()
+                else:
+                    # Если сессия не авторизована, делаем авторизацию
+                    self.logger.info("Авторизация нового пользователя...")
+                    await self.client.start(phone=Config.PHONE)
+                    me = await self.client.get_me()
+            
             if not me:
                 self.logger.error("Не удалось получить информацию о пользователе")
                 return False
@@ -138,8 +165,51 @@ class TelegramGroupParser:
         except ValueError as e:
             self.logger.error(f"Ошибка валидации при инициализации: {e}")
             return False
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower():
+                self.logger.error(f"❌ База данных сессии заблокирована другим процессом")
+                self.logger.error(f"   Это означает, что парсер уже запущен в другом окне/процессе")
+                
+                # Пытаемся найти процесс, который блокирует файл
+                session_path = Config.SESSION_NAME
+                if os.path.exists(session_path):
+                    try:
+                        # Используем lsof для поиска процессов, использующих файл
+                        result = subprocess.run(
+                            ['lsof', session_path],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        if result.returncode == 0 and result.stdout:
+                            lines = result.stdout.strip().split('\n')
+                            if len(lines) > 1:  # Первая строка - заголовок
+                                self.logger.error(f"   Найден процесс, использующий сессию:")
+                                for line in lines[1:]:  # Пропускаем заголовок
+                                    parts = line.split()
+                                    if len(parts) >= 2:
+                                        pid = parts[1]
+                                        cmd = ' '.join(parts[8:]) if len(parts) > 8 else 'unknown'
+                                        self.logger.error(f"      PID: {pid}, Команда: {cmd}")
+                                self.logger.error(f"   Решение: завершите процесс (kill {parts[1]}) или подождите завершения")
+                            else:
+                                self.logger.error(f"   Решение: подождите несколько секунд и попробуйте снова")
+                        else:
+                            self.logger.error(f"   Решение: подождите несколько секунд и попробуйте снова")
+                    except Exception:
+                        self.logger.error(f"   Решение: подождите несколько секунд и попробуйте снова")
+                else:
+                    self.logger.error(f"   Решение: подождите несколько секунд и попробуйте снова")
+            else:
+                self.logger.error(f"Ошибка SQLite: {e}")
+            return False
         except Exception as e:
-            self.logger.error(f"Ошибка инициализации клиента: {e}")
+            error_msg = str(e).lower()
+            if "database is locked" in error_msg or "sqlite" in error_msg:
+                self.logger.error(f"❌ База данных заблокирована: {e}")
+                self.logger.error(f"   Вероятно, парсер уже запущен. Завершите другие процессы и попробуйте снова")
+            else:
+                self.logger.error(f"Ошибка инициализации клиента: {e}")
             return False
     
     async def get_chat_info(self, chat_identifier, retries=0):
@@ -152,8 +222,9 @@ class TelegramGroupParser:
         if not self.client or not self.client.is_connected():
             return self._create_error_info(chat_identifier, "Клиент не подключен")
         
-        # Случайная задержка от 3 до 7 секунд
+        # Случайная задержка от 3 до 7 секунд перед запросом
         delay = random.uniform(self.min_delay, self.max_delay)
+        self.logger.info(f"⏳ Задержка {delay:.2f} секунд перед запросом для {chat_identifier}")
         await asyncio.sleep(delay)
         
         try:
@@ -284,14 +355,31 @@ class TelegramGroupParser:
             
         except FloodWaitError as e:
             wait_time = e.seconds
-            self.logger.warning(f"⏳ FloodWait для {chat_identifier}: ждем {wait_time} секунд")
+            wait_hours = wait_time / 3600
+            wait_days = wait_time / 86400
+            
+            # Если FloodWait слишком долгий (более 2 часов), прерываем обработку
+            MAX_WAIT_HOURS = 2
+            if wait_time > MAX_WAIT_HOURS * 3600:
+                self.logger.error(f"❌ FloodWait для {chat_identifier}: требуется ожидание {wait_hours:.1f} часов ({wait_days:.1f} дней)")
+                self.logger.error(f"   Это слишком долго для автоматического ожидания (максимум: {MAX_WAIT_HOURS} часа)")
+                self.logger.error(f"   Telegram API ограничил запросы из-за предыдущей активности")
+                self.logger.error(f"   Рекомендация: прервите обработку (Ctrl+C) и попробуйте через {wait_hours:.1f} часов")
+                return self._create_error_info(chat_identifier, f"FloodWait слишком долгий: {wait_hours:.1f} часов. Обработка прервана. Попробуйте позже.")
+            
+            self.logger.warning(f"⏳ FloodWait для {chat_identifier}: ждем {wait_time} секунд ({wait_hours:.1f} часов)")
             
             # Добавляем небольшую случайную задержку для избежания синхронизации
             additional_wait = random.randint(1, 5)
             total_wait = wait_time + additional_wait
             
-            self.logger.info(f"⏱️  Общее время ожидания: {total_wait} секунд (FloodWait: {wait_time}s + случайная: {additional_wait}s)")
-            await asyncio.sleep(total_wait)
+            self.logger.info(f"⏱️  Общее время ожидания: {total_wait} секунд ({total_wait/3600:.1f} часов) (FloodWait: {wait_time}s + случайная: {additional_wait}s)")
+            
+            try:
+                await asyncio.sleep(total_wait)
+            except asyncio.CancelledError:
+                self.logger.warning(f"Ожидание FloodWait прервано для {chat_identifier}")
+                return self._create_error_info(chat_identifier, "FloodWait прерван пользователем")
             
             if retries < Config.MAX_RETRIES:
                 self.logger.info(f"🔄 Повторная попытка {retries + 1}/{Config.MAX_RETRIES} для {chat_identifier}")
@@ -1060,6 +1148,9 @@ class TelegramGroupParser:
                     self.logger.info(f"⏭️  [{current_position}/{total_groups}] Пропускаем '{group_title}' ({chat_identifier}) - уже обработана")
                     skipped += 1
                     continue
+                
+                # Примечание: для пропущенных групп задержка не применяется (это нормально),
+                # задержка применяется только перед реальными запросами к API
                 
                 # Рассчитываем прогресс и время (только для групп, которые будут обрабатываться)
                 remaining_groups = total_groups - current_position
