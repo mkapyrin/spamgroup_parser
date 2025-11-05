@@ -30,6 +30,15 @@ from tqdm.asyncio import tqdm
 from .config import Config
 from .logger_config import setup_logging, log_separator, log_progress
 
+class CriticalFloodWaitError(Exception):
+    """Исключение для критического FloodWait, который требует прерывания обработки"""
+    def __init__(self, wait_time, chat_identifier):
+        self.wait_time = wait_time
+        self.chat_identifier = chat_identifier
+        self.wait_hours = wait_time / 3600
+        self.wait_days = wait_time / 86400
+        super().__init__(f"FloodWait слишком долгий: {self.wait_hours:.1f} часов для {chat_identifier}")
+
 class TelegramGroupParser:
     """Класс для парсинга информации о Telegram группах"""
     
@@ -45,6 +54,47 @@ class TelegramGroupParser:
         warnings.filterwarnings("ignore", message=".*session already had an authorized user.*", category=UserWarning)
         warnings.filterwarnings("ignore", message=".*the session already had an authorized user.*", category=UserWarning)
         warnings.filterwarnings("ignore", message=".*did not login to the user account.*", category=UserWarning)
+        
+        # Настраиваем логирование Telethon - только WARNING и выше, чтобы не засорять логи
+        # Сетевые ошибки (Connection reset, Can't assign requested address и т.д.) - это нормально
+        # Telethon автоматически переподключается, не нужно логировать каждое событие
+        telethon_logger = logging.getLogger('telethon')
+        telethon_logger.setLevel(logging.WARNING)
+        
+        # Фильтруем специфичные сообщения Telethon, которые не важны
+        class TelethonFilter(logging.Filter):
+            """Фильтр для подавления лишних сообщений Telethon"""
+            def filter(self, record):
+                # Подавляем сообщения о переподключениях и обновлениях
+                message = record.getMessage()
+                # Игнорируем рутинные сообщения о переподключениях
+                if any(phrase in message for phrase in [
+                    "Got difference for account updates",
+                    "Got difference for channel",
+                    "Connection closed while receiving data",
+                    "Closing current connection to begin reconnect",
+                    "Connection to",
+                    "Connection complete",
+                    "Disconnecting from",
+                    "Disconnection from",
+                    "Not disconnecting",
+                    "during disconnect",
+                    "Server closed the connection",
+                    "Server resent the older message",
+                    "Server sent a very old message"
+                ]):
+                    return False
+                return True
+        
+        # Применяем фильтр к логгерам Telethon
+        for handler in telethon_logger.handlers:
+            handler.addFilter(TelethonFilter())
+        
+        # Также применяем к корневому логгеру, если Telethon использует его
+        root_logger = logging.getLogger()
+        for handler in root_logger.handlers:
+            if not any(isinstance(f, TelethonFilter) for f in handler.filters):
+                handler.addFilter(TelethonFilter())
         
     async def get_member_count_via_bot_api(self, chat_identifier, bot_token=None):
         '''Получает количество участников через Bot API (если доступен bot token)'''
@@ -252,11 +302,17 @@ class TelegramGroupParser:
                 self.logger.warning(f"⚠️  Username не существует для {chat_identifier} - пропускаем без повторов")
                 return self._create_error_info(chat_identifier, error_msg, 'access_denied')
             except Exception as e:
-                # Проверяем другие ошибки "No user has"
+                # Проверяем другие ошибки "No user has", "Nobody is using", "username is unacceptable"
                 error_str = str(e).lower()
-                if 'no user has' in error_str or 'username not occupied' in error_str:
-                    error_msg = f"Username не существует: {str(e)}"
-                    self.logger.warning(f"⚠️  Username не существует для {chat_identifier} - пропускаем без повторов")
+                if any(phrase in error_str for phrase in [
+                    'no user has',
+                    'username not occupied',
+                    'nobody is using this username',
+                    'username is unacceptable',
+                    'nobody is using'
+                ]):
+                    error_msg = f"Username не существует или неприемлем: {str(e)}"
+                    self.logger.warning(f"⚠️  Username не существует или неприемлем для {chat_identifier} - пропускаем без повторов")
                     return self._create_error_info(chat_identifier, error_msg, 'access_denied')
                 # Для других ошибок пробрасываем дальше
                 raise
@@ -365,7 +421,9 @@ class TelegramGroupParser:
                 self.logger.error(f"   Это слишком долго для автоматического ожидания (максимум: {MAX_WAIT_HOURS} часа)")
                 self.logger.error(f"   Telegram API ограничил запросы из-за предыдущей активности")
                 self.logger.error(f"   Рекомендация: прервите обработку (Ctrl+C) и попробуйте через {wait_hours:.1f} часов")
-                return self._create_error_info(chat_identifier, f"FloodWait слишком долгий: {wait_hours:.1f} часов. Обработка прервана. Попробуйте позже.")
+                self.logger.error(f"   ⚠️  Обработка будет прервана для предотвращения длительного ожидания")
+                # Вызываем специальное исключение для прерывания обработки
+                raise CriticalFloodWaitError(wait_time, chat_identifier)
             
             self.logger.warning(f"⏳ FloodWait для {chat_identifier}: ждем {wait_time} секунд ({wait_hours:.1f} часов)")
             
@@ -418,13 +476,16 @@ class TelegramGroupParser:
             error_msg = f"Неожиданная ошибка: {str(e)}"
             error_str = str(e).lower()
             
-            # Проверяем, является ли это ошибкой "No user has" или "Username не существует"
+            # Проверяем, является ли это ошибкой "No user has", "Nobody is using" или "Username не существует"
             # Такие ошибки не нужно повторять - username не появится
             is_no_user_error = (
                 'no user has' in error_str or 
                 'username not occupied' in error_str or
                 'username не существует' in error_str or
-                'username does not exist' in error_str
+                'username does not exist' in error_str or
+                'nobody is using this username' in error_str or
+                'username is unacceptable' in error_str or
+                'nobody is using' in error_str
             )
             
             if is_no_user_error:
@@ -1117,6 +1178,24 @@ class TelegramGroupParser:
             start_time = time.time()
             total_groups = len(df)
             
+            # Настройки для пауз между батчами запросов
+            # Случайный интервал между паузами: 50-100 запросов
+            pause_interval = random.randint(50, 100)
+            # Случайная длительность паузы: 5-10 минут
+            pause_minutes = random.randint(5, 10)
+            pause_seconds = pause_minutes * 60
+            
+            # Счетчик запросов к API (только реальные запросы, не пропущенные)
+            api_requests_count = 0
+            
+            self.logger.info("")
+            self.logger.info("=" * 70)
+            self.logger.info("📊 Настройки пауз между батчами запросов:")
+            self.logger.info(f"   Пауза каждые: {pause_interval} запросов")
+            self.logger.info(f"   Длительность паузы: {pause_minutes} минут")
+            self.logger.info("=" * 70)
+            self.logger.info("")
+            
             # Функция форматирования времени
             def format_time(seconds):
                 if seconds < 60:
@@ -1174,8 +1253,79 @@ class TelegramGroupParser:
                     self.logger.info(f"   Username: {group_username}")
                 self.logger.info(f"   Идентификатор: {chat_identifier}")
                 
+                # Проверяем, нужно ли сделать паузу между батчами
+                if api_requests_count > 0 and api_requests_count % pause_interval == 0:
+                    self.logger.info("")
+                    self.logger.info("=" * 70)
+                    self.logger.info(f"⏸️  ПАУЗА: обработано {api_requests_count} запросов")
+                    self.logger.info(f"   Делаем паузу на {pause_minutes} минут для снижения нагрузки на API")
+                    self.logger.info(f"   Это поможет избежать FloodWait и других ограничений")
+                    self.logger.info("=" * 70)
+                    
+                    # Показываем обратный отсчет
+                    total_wait_seconds = pause_minutes * 60
+                    elapsed_seconds = 0
+                    
+                    while elapsed_seconds < total_wait_seconds:
+                        remaining_seconds = total_wait_seconds - elapsed_seconds
+                        remaining_minutes = int(remaining_seconds // 60)
+                        remaining_secs = int(remaining_seconds % 60)
+                        
+                        if remaining_seconds > 60:
+                            # Обновляем каждую минуту
+                            self.logger.info(f"⏳ Осталось ждать: {remaining_minutes}м {remaining_secs}с")
+                            await asyncio.sleep(60)
+                            elapsed_seconds += 60
+                        else:
+                            # Последняя минута - обновляем каждые 30 секунд
+                            self.logger.info(f"⏳ Осталось ждать: {remaining_secs}с")
+                            sleep_time = min(30, remaining_seconds)
+                            await asyncio.sleep(sleep_time)
+                            elapsed_seconds += sleep_time
+                    
+                    self.logger.info("✅ Пауза завершена, продолжаем обработку...")
+                    self.logger.info("")
+                    
+                    # Определяем новый случайный интервал для следующей паузы
+                    pause_interval = random.randint(50, 100)
+                    pause_minutes = random.randint(5, 10)
+                    pause_seconds = pause_minutes * 60
+                    self.logger.info(f"📊 Следующая пауза будет через {pause_interval} запросов на {pause_minutes} минут")
+                    self.logger.info("")
+                
                 # Получаем информацию о группе
-                info = await self.get_chat_info(chat_identifier)
+                try:
+                    info = await self.get_chat_info(chat_identifier)
+                    # Увеличиваем счетчик после каждого реального запроса к API
+                    api_requests_count += 1
+                except CriticalFloodWaitError as e:
+                    # Критический FloodWait - прерываем обработку
+                    self.logger.error("")
+                    self.logger.error("=" * 70)
+                    self.logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: FloodWait слишком долгий")
+                    self.logger.error(f"   Группа: {e.chat_identifier}")
+                    self.logger.error(f"   Требуется ожидание: {e.wait_hours:.1f} часов ({e.wait_days:.1f} дней)")
+                    self.logger.error(f"   Это превышает максимально допустимое время ожидания (2 часа)")
+                    self.logger.error("")
+                    self.logger.error("💡 Рекомендации:")
+                    self.logger.error("   1. Прервите обработку (Ctrl+C)")
+                    self.logger.error(f"   2. Подождите {e.wait_hours:.1f} часов и попробуйте снова")
+                    self.logger.error("   3. Проверьте, не слишком ли часто вы делаете запросы к API")
+                    self.logger.error("")
+                    self.logger.error("⚠️  Обработка прервана для предотвращения длительного ожидания")
+                    self.logger.error("=" * 70)
+                    
+                    # Сохраняем текущий прогресс перед выходом
+                    if new_rows:
+                        try:
+                            new_df = pd.DataFrame(new_rows)
+                            # ... сохранение данных ...
+                            self.logger.info(f"💾 Сохранен промежуточный прогресс: {len(new_rows)} групп")
+                        except Exception as save_error:
+                            self.logger.error(f"Ошибка при сохранении промежуточного прогресса: {save_error}")
+                    
+                    # Прерываем обработку
+                    raise
                 
                 if info:
                     # Создаем новую строку с данными
