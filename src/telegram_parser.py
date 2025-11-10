@@ -45,9 +45,9 @@ class TelegramGroupParser:
     def __init__(self):
         self.logger = setup_logging()
         self.client = None
-        # Используем случайную задержку от 3 до 7 секунд вместо фиксированного throttler
-        self.min_delay = 3.0
-        self.max_delay = 7.0
+        # Используем случайную задержку от 9 до 21 секунд вместо фиксированного throttler
+        self.min_delay = 9.0
+        self.max_delay = 21.0
         self.current_user_id = None  # ID текущего пользователя для проверки прав
         
         # Подавляем предупреждение о существующей сессии глобально при инициализации
@@ -428,7 +428,7 @@ class TelegramGroupParser:
             self.logger.warning(f"⏳ FloodWait для {chat_identifier}: ждем {wait_time} секунд ({wait_hours:.1f} часов)")
             
             # Добавляем небольшую случайную задержку для избежания синхронизации
-            additional_wait = random.randint(1, 5)
+            additional_wait = random.randint(3, 15)
             total_wait = wait_time + additional_wait
             
             self.logger.info(f"⏱️  Общее время ожидания: {total_wait} секунд ({total_wait/3600:.1f} часов) (FloodWait: {wait_time}s + случайная: {additional_wait}s)")
@@ -1118,6 +1118,11 @@ class TelegramGroupParser:
                     os.path.basename(input_file_path)
                 )
             
+            # Сохраняем путь к исходному файлу для последующего удаления несуществующих групп
+            original_input_file = input_file_path
+            # Список индексов групп для удаления (с ошибкой "Username не существует или неприемлем")
+            groups_to_remove = []
+            
             # Загружаем существующие данные для проверки дубликатов
             if existing_data:
                 existing_df, processed_ids, processed_usernames = existing_data
@@ -1179,10 +1184,10 @@ class TelegramGroupParser:
             total_groups = len(df)
             
             # Настройки для пауз между батчами запросов
-            # Случайный интервал между паузами: 50-100 запросов
-            pause_interval = random.randint(50, 100)
-            # Случайная длительность паузы: 5-10 минут
-            pause_minutes = random.randint(5, 10)
+            # Случайный интервал между паузами: 150-300 запросов
+            pause_interval = random.randint(150, 300)
+            # Случайная длительность паузы: 15-30 минут
+            pause_minutes = random.randint(15, 30)
             pause_seconds = pause_minutes * 60
             
             # Счетчик запросов к API (только реальные запросы, не пропущенные)
@@ -1287,8 +1292,8 @@ class TelegramGroupParser:
                     self.logger.info("")
                     
                     # Определяем новый случайный интервал для следующей паузы
-                    pause_interval = random.randint(50, 100)
-                    pause_minutes = random.randint(5, 10)
+                    pause_interval = random.randint(150, 300)
+                    pause_minutes = random.randint(15, 30)
                     pause_seconds = pause_minutes * 60
                     self.logger.info(f"📊 Следующая пауза будет через {pause_interval} запросов на {pause_minutes} минут")
                     self.logger.info("")
@@ -1344,7 +1349,20 @@ class TelegramGroupParser:
                             self.logger.info(f"   Можно постить: {info.get('can_send_messages', 'N/A')}")
                     elif status == 'access_denied':
                         access_denied += 1
-                        self.logger.warning(f"🚫 Доступ запрещен: {group_title}")
+                        error_msg = info.get('error_message', '')
+                        # Проверяем, является ли это ошибкой "Username не существует или неприемлем"
+                        if error_msg and any(phrase in error_msg for phrase in [
+                            'Username не существует',
+                            'неприемлем',
+                            'Username not occupied',
+                            'Nobody is using this username',
+                            'username is unacceptable'
+                        ]):
+                            # Добавляем индекс группы для удаления из исходного списка
+                            groups_to_remove.append(index)
+                            self.logger.warning(f"🗑️  Группа '{group_title}' будет удалена из списка (username не существует или неприемлем)")
+                        else:
+                            self.logger.warning(f"🚫 Доступ запрещен: {group_title}")
                     else:
                         errors += 1
                         error_msg = info.get('error_message', 'Неизвестная ошибка')
@@ -1431,6 +1449,32 @@ class TelegramGroupParser:
                 self.logger.error(f"❌ Ошибка при сохранении файла {output_file_path}: {e}")
                 raise
             
+            # Удаляем группы с несуществующими username из исходного файла
+            if groups_to_remove:
+                self.logger.info("")
+                self.logger.info("=" * 70)
+                self.logger.info(f"🗑️  Удаление {len(groups_to_remove)} групп с несуществующими username из исходного файла")
+                self.logger.info("=" * 70)
+                
+                # Удаляем группы из исходного DataFrame
+                # groups_to_remove содержит позиции в DataFrame (0, 1, 2, ...), используем iloc для надежности
+                indices_to_remove = df.iloc[groups_to_remove].index
+                df_cleaned = df.drop(indices_to_remove)
+                
+                # Сохраняем обновленный DataFrame обратно в исходный файл
+                try:
+                    df_cleaned.to_csv(original_input_file, index=False, encoding='utf-8')
+                    self.logger.info(f"✅ Исходный файл обновлен: {original_input_file}")
+                    self.logger.info(f"   Удалено групп: {len(groups_to_remove)}")
+                    self.logger.info(f"   Осталось групп: {len(df_cleaned)}")
+                except PermissionError as e:
+                    self.logger.error(f"❌ Нет прав на запись в исходный файл {original_input_file}: {e}")
+                except OSError as e:
+                    self.logger.error(f"❌ Ошибка записи исходного файла {original_input_file}: {e}")
+                except Exception as e:
+                    self.logger.error(f"❌ Ошибка при сохранении исходного файла {original_input_file}: {e}")
+                self.logger.info("")
+            
             # Выводим статистику
             log_separator(self.logger, "РЕЗУЛЬТАТЫ")
             self.logger.info(f"📊 Входных записей: {len(df)}")
@@ -1438,6 +1482,8 @@ class TelegramGroupParser:
             self.logger.info(f"⏭️  Пропущено (уже обработано): {skipped}")
             self.logger.info(f"🚫 Доступ запрещен: {access_denied}")
             self.logger.info(f"❌ Ошибки: {errors}")
+            if groups_to_remove:
+                self.logger.info(f"🗑️  Удалено из исходного файла: {len(groups_to_remove)}")
             self.logger.info(f"📁 Итого записей в файле: {len(final_df) if 'final_df' in locals() else len(existing_df)}")
             self.logger.info(f"💾 Результат сохранен в: {output_file_path}")
             log_separator(self.logger, "ОБРАБОТКА ЗАВЕРШЕНА")

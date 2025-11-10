@@ -113,7 +113,29 @@ async def main():
         os.makedirs(Config.LOGS_DIR, exist_ok=True)
         
         # Запускаем парсер
-        async with TelegramGroupParser() as parser:
+        parser = TelegramGroupParser()
+        
+        # Автоматически объединяем новые файлы из input/ в groups.csv перед обработкой
+        # Это происходит всегда, кроме случая с --all-files (там объединение происходит внутри process_all_input_files)
+        if not args.all_files:
+            logger.info("")
+            logger.info("=" * 50)
+            logger.info("🔍 Проверка новых файлов в input/")
+            logger.info("=" * 50)
+            merge_result = parser._merge_csv_files_to_groups()
+            
+            if merge_result['merged_files'] > 0:
+                logger.info("")
+                logger.info(f"✅ Объединено файлов: {merge_result['merged_files']}")
+                logger.info(f"✅ Добавлено новых групп: {merge_result['added_groups']}")
+                logger.info(f"⏭️  Пропущено дубликатов: {merge_result['skipped_groups']}")
+                logger.info(f"📊 Итого групп в groups.csv: {merge_result['total_groups']}")
+                logger.info("")
+            else:
+                logger.info("ℹ️  Новых файлов для объединения не найдено")
+                logger.info("")
+        
+        async with parser:
             if args.all_files:
                 # Обрабатываем все файлы из input/
                 result = await parser.process_all_input_files()
